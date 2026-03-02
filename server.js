@@ -49,10 +49,13 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 
 // MySQL Database connection pool - CRITICAL FOR SERVERLESS
 const db = mysql.createPool({
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME || 'ecommerce',
+    database: process.env.DB_NAME,
+    ssl: {
+    rejectUnauthorized: false // Required for Aiven/Vercel handshake
+    },
     waitForConnections: true,
     connectionLimit: 3,  // VERY LOW to avoid max_user_connections limit
     queueLimit: 10,      // Allow queuing of requests

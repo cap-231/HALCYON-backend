@@ -13,8 +13,9 @@ const corsOptions = {
     origin: function (origin, callback) {
         // Allow requests from your known frontend URLs and Vercel previews
         const allowedOrigins = [
-            'https://halcyon-rho.vercel.app',
+            'https://ecom-frontend-lyart-nine.vercel.app',
             'https://ecom-frontend-1s95oo36v-cap-231s-projects.vercel.app',
+            'https://halcyon-rho.vercel.app',
             'http://localhost:3000',
             'http://localhost:5001'
         ];
@@ -29,7 +30,7 @@ const corsOptions = {
         }
 
         // Allow any Vercel deployments for this frontend project
-        if (origin.endsWith('.vercel.app') && origin.includes('halcyon-')) {
+        if (origin.endsWith('.vercel.app') && origin.includes('ecom-frontend-')) {
             return callback(null, true);
         }
 
@@ -49,21 +50,22 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 
 // MySQL Database connection pool - CRITICAL FOR SERVERLESS
 // use global variable to reuse pool in warm lambdas
-const db = global.__dbPool || mysql.createPool({
+const dbConfig = {
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     waitForConnections: true,
-    ssl: {
-    rejectUnauthorized: false // Required for Aiven/Vercel handshake
-     },
+    connectionLimit: 1,
+    queueLimit: 10,
+    enableKeepAlive: true
+};
 
-    connectionLimit: 1,  // restrict each lambda to one connection
-    queueLimit: 10,      // Allow queuing of requests
-    enableKeepAlive: true,
-    keepAliveInitialDelayMs: 0
-});
+if (process.env.DB_SSL === 'true') {
+    dbConfig.ssl = { rejectUnauthorized: false };
+}
+
+const db = global.__dbPool || mysql.createPool(dbConfig);
 if (!global.__dbPool) {
     global.__dbPool = db;
     console.log('✅ MySQL connection pool created (limit=1, queue=10)');

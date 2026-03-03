@@ -30,11 +30,14 @@ const corsOptions = {
         }
 
         // Allow any Vercel deployments for this frontend project
-        if (origin.endsWith('.vercel.app') && origin.includes('ecom-frontend-')) {
+        if (origin.endsWith('.vercel.app') && (origin.includes('ecom-frontend-') || origin.includes('halcyon'))) {
             return callback(null, true);
         }
 
-        return callback(new Error('Not allowed by CORS'));
+        // Allow all Vercel deployments (for development)
+        if (origin.endsWith('.vercel.app')) {
+            return callback(null, true);
+        }
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -606,144 +609,153 @@ app.post('/order/checkout', verifyCustomerToken, async (req, res) => {
         });
         const totalAmount = items.reduce((sum, item) => sum + (item.price * item.quantity), 0) + totalTax;
 
-        db.beginTransaction(err => {
-            if (err) return res.status(500).json({ error: 'Database error (begin transaction)' });
+        db.getConnection((err, connection) => {
+            if (err) return res.status(500).json({ error: 'Database error (get connection)' });
 
-            const orderQuery = 'INSERT INTO orders (CustomerID, TotalAmount, OrderDate, Status) VALUES (?, ?, NOW(), ?)';
-            db.query(orderQuery, [customerId, totalAmount, 'Processing'], (err, orderResult) => {
+            connection.beginTransaction(err => {
                 if (err) {
-                    db.rollback(() => {});
-                    console.log("ye raha");
-                    console.log(err);
-                    return res.status(500).json({ error: 'Database error (insert order)' });
+                    connection.release();
+                    return res.status(500).json({ error: 'Database error (begin transaction)' });
                 }
 
-                const orderId = orderResult.insertId;
+                const orderQuery = 'INSERT INTO orders (CustomerID, TotalAmount, OrderDate, Status) VALUES (?, ?, NOW(), ?)';
+                connection.query(orderQuery, [customerId, totalAmount, 'Processing'], (err, orderResult) => {
+                    if (err) {
+                        connection.rollback(() => {});
+                        connection.release();
+                        return res.status(500).json({ error: 'Database error (insert order)' });
+                    }
 
-                // Insert tax info for each product in the order
-                if (taxInserts.length > 0) {
-                    const taxInsertQuery = 'INSERT INTO tax (TaxID, ProductID, TaxRate, TaxType) VALUES ?';
-                    db.query(taxInsertQuery, [taxInserts], (taxInsertErr) => {
-                        if (taxInsertErr) {
-                            db.rollback(() => {});
-                            return res.status(500).json({ error: 'Database error (insert tax info)' });
-                        }
-                        // Continue with the rest of the order logic
-                        continueOrderPlacement();
-                    });
-                } else {
-                    continueOrderPlacement();
-                }
+                    const orderId = orderResult.insertId;
 
-                function continueOrderPlacement() {
-                    // Insert shipping info
-                    const shippingQuery = 'INSERT INTO shipping (OrderID, Address, Status) VALUES (?, ?, ?)';
-                    db.query(shippingQuery, [orderId, address, 'Processing'], (err, shippingResult) => {
-                        if (err) {
-                            db.rollback(() => {});
-                            return res.status(500).json({ error: 'Database error (insert shipping)' });
-                        }
-                        // Insert into trackinginfo table
-                        const trackingInfoQuery = 'INSERT INTO trackinginfo (OrderID, Status, EstimatedDelivery) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))';
-                        db.query(trackingInfoQuery, [orderId, 'In Transit'], (err, trackingResult) => {
-                            if (err) {
-                                db.rollback(() => {});
-                                return res.status(500).json({ error: 'Database error (insert tracking info)' });
+                    // Insert tax info for each product in the order
+                    if (taxInserts.length > 0) {
+                        const taxInsertQuery = 'INSERT INTO tax (TaxID, ProductID, TaxRate, TaxType) VALUES ?';
+                        connection.query(taxInsertQuery, [taxInserts], (taxInsertErr) => {
+                            if (taxInsertErr) {
+                                connection.rollback(() => {});
+                                connection.release();
+                                return res.status(500).json({ error: 'Database error (insert tax info)' });
                             }
-                            const trackingId = trackingResult.insertId;
-                            // Update shipping with TrackingID
-                            const updateShippingQuery = 'UPDATE shipping SET TrackingID = ? WHERE ShippingID = ?';
-                            db.query(updateShippingQuery, [trackingId, shippingResult.insertId], (err) => {
-                                if (err) {
-                                    db.rollback(() => {});
-                                    return res.status(500).json({ error: 'Database error (update shipping with tracking ID)' });
-                                }
-                                // Insert into payment table
-                                const paymentQuery = 'INSERT INTO payment (OrderID, Amount, PaymentMethod, PaymentStatus, TransactionID) VALUES (?, ?, ?, ?, ?)';
-                                db.query(paymentQuery, [orderId, totalAmount, paymentMethod, 'Pending', transactionId], (err, paymentResult) => {
-                                    if (err) {
-                                        db.rollback(() => {});
-                                        return res.status(500).json({ error: 'Database error (insert payment)' });
-                                    }
-                                    const paymentId = paymentResult.insertId;
-                                    // Update order with PaymentID
-                                    const updateOrderQuery = 'UPDATE orders SET PaymentID = ? WHERE OrderID = ?';
-                                    db.query(updateOrderQuery, [paymentId, orderId], (err) => {
-                                        if (err) {
-                                            db.rollback(() => {});
-                                            return res.status(500).json({ error: 'Database error (update order with payment ID)' });
-                                        }
-                                        // Insert order items
-                                        const orderItemsData = items.map(item => [orderId, item.productId, item.quantity, item.price * item.quantity]);
-                                        const orderItemsQuery = 'INSERT INTO orderitem (OrderID, ProductID, Quantity, Subtotal) VALUES ?';
-                                        db.query(orderItemsQuery, [orderItemsData], (err) => {
-                                            if (err) {
-                                                db.rollback(() => {});
-                                                return res.status(500).json({ error: 'Database error (insert order items)' });
-                                            }
-                                            // Clear cart
-                                            const clearCartQuery = 'DELETE FROM cart WHERE CustomerID = ?';
-                                            db.query(clearCartQuery, [customerId], (err) => {
-                                                if (err) {
-                                                    db.rollback(() => {});
-                                                    return res.status(500).json({ error: 'Database error (clear cart)' });
-                                                }
-                                                db.commit(err => {
-                                                    if (err) {
-                                                        db.rollback(() => {});
-                                                        return res.status(500).json({ error: 'Database error (commit)' });
-                                                    }
-                                                    // Award loyalty points after successful order
-                                                    const pointsEarned = Math.floor(totalAmount / 10); // 1 point per $10
-                                                    console.log('Loyalty points to award:', pointsEarned, 'for customer:', customerId);
-                                                    if (pointsEarned > 0) {
-                                                        // Check if customer already has a LoyaltyPoints row
-                                                        db.query('SELECT * FROM LoyaltyPoints WHERE CustomerID = ?', [customerId], (err, result) => {
-                                                            if (err) {
-                                                                console.error('Error checking LoyaltyPoints:', err);
-                                                                return res.json({ message: 'Order placed, but error updating loyalty points.' });
-                                                            }
-                                                            if (result.length > 0) {
-                                                                // Update existing
-                                                                db.query('UPDATE LoyaltyPoints SET Points = Points + ? WHERE CustomerID = ?', [pointsEarned, customerId], (err2) => {
-                                                                    if (err2) {
-                                                                        console.error('Error updating LoyaltyPoints:', err2);
-                                                                    } else {
-                                                                        console.log('LoyaltyPoints updated for customer:', customerId);
-                                                                        db.query('INSERT INTO PointsHistory (CustomerID, Points, Description, Date) VALUES (?, ?, ?, NOW())', [customerId, pointsEarned, 'Points earned from order'], (err3) => {
-                                                                            if (err3) console.error('Error inserting PointsHistory:', err3);
-                                                                        });
-                                                                    }
-                                                                });
-                                                            } else {
-                                                                // Insert new
-                                                                db.query('INSERT INTO LoyaltyPoints (CustomerID, Points, EarnedDate) VALUES (?, ?, NOW())', [customerId, pointsEarned], (err2) => {
-                                                                    if (err2) {
-                                                                        console.error('Error inserting LoyaltyPoints:', err2);
-                                                                    } else {
-                                                                        console.log('LoyaltyPoints inserted for customer:', customerId);
-                                                                        db.query('INSERT INTO PointsHistory (CustomerID, Points, Description, Date) VALUES (?, ?, ?, NOW())', [customerId, pointsEarned, 'Points earned from order'], (err3) => {
-                                                                            if (err3) console.error('Error inserting PointsHistory:', err3);
-                                                                        });
-                                                                    }
-                                                                });
-                                                            }
-                                                        });
-                                                    }
-                                                    res.json({ message: 'Order, shipping, payment, and tax placed successfully!', trackingNumber: trackingId, totalTax, loyaltyPoints: pointsEarned });
-                                                });
-                                            });
-                                        });
-                                    });
-                                });
-                            });
+                            continueOrderPlacement(connection, orderId, totalAmount, paymentMethod, transactionId, items, customerId, totalTax);
                         });
-                    });
-                }
+                    } else {
+                        continueOrderPlacement(connection, orderId, totalAmount, paymentMethod, transactionId, items, customerId, totalTax);
+                    }
+                });
             });
         });
     });
 });
+
+function continueOrderPlacement(connection, orderId, totalAmount, paymentMethod, transactionId, items, customerId, totalTax) {
+    // Insert shipping info
+    const shippingQuery = 'INSERT INTO shipping (OrderID, Address, Status) VALUES (?, ?, ?)';
+    connection.query(shippingQuery, [orderId, address || 'Default Address', 'Processing'], (err, shippingResult) => {
+        if (err) {
+            connection.rollback(() => {});
+            connection.release();
+            return res.status(500).json({ error: 'Database error (insert shipping)' });
+        }
+        // Insert into trackinginfo table
+        const trackingInfoQuery = 'INSERT INTO trackinginfo (OrderID, Status, EstimatedDelivery) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))';
+        connection.query(trackingInfoQuery, [orderId, 'In Transit'], (err, trackingResult) => {
+            if (err) {
+                connection.rollback(() => {});
+                connection.release();
+                return res.status(500).json({ error: 'Database error (insert tracking info)' });
+            }
+            const trackingId = trackingResult.insertId;
+            // Update shipping with TrackingID
+            const updateShippingQuery = 'UPDATE shipping SET TrackingID = ? WHERE ShippingID = ?';
+            connection.query(updateShippingQuery, [trackingId, shippingResult.insertId], (err) => {
+                if (err) {
+                    connection.rollback(() => {});
+                    connection.release();
+                    return res.status(500).json({ error: 'Database error (update shipping with tracking ID)' });
+                }
+                // Insert into payment table
+                const paymentQuery = 'INSERT INTO payment (OrderID, Amount, PaymentMethod, PaymentStatus, TransactionID) VALUES (?, ?, ?, ?, ?)';
+                connection.query(paymentQuery, [orderId, totalAmount, paymentMethod, 'Pending', transactionId], (err, paymentResult) => {
+                    if (err) {
+                        connection.rollback(() => {});
+                        connection.release();
+                        return res.status(500).json({ error: 'Database error (insert payment)' });
+                    }
+                    const paymentId = paymentResult.insertId;
+                    // Update order with PaymentID
+                    const updateOrderQuery = 'UPDATE orders SET PaymentID = ? WHERE OrderID = ?';
+                    connection.query(updateOrderQuery, [paymentId, orderId], (err) => {
+                        if (err) {
+                            connection.rollback(() => {});
+                            connection.release();
+                            return res.status(500).json({ error: 'Database error (update order with payment ID)' });
+                        }
+                        // Insert order items
+                        const orderItemsData = items.map(item => [orderId, item.productId, item.quantity, item.price * item.quantity]);
+                        const orderItemsQuery = 'INSERT INTO orderitem (OrderID, ProductID, Quantity, Subtotal) VALUES ?';
+                        connection.query(orderItemsQuery, [orderItemsData], (err) => {
+                            if (err) {
+                                connection.rollback(() => {});
+                                connection.release();
+                                return res.status(500).json({ error: 'Database error (insert order items)' });
+                            }
+                            // Clear cart
+                            const clearCartQuery = 'DELETE FROM cart WHERE CustomerID = ?';
+                            connection.query(clearCartQuery, [customerId], (err) => {
+                                if (err) {
+                                    connection.rollback(() => {});
+                                    connection.release();
+                                    return res.status(500).json({ error: 'Database error (clear cart)' });
+                                }
+                                connection.commit(err => {
+                                    if (err) {
+                                        connection.rollback(() => {});
+                                        connection.release();
+                                        return res.status(500).json({ error: 'Database error (commit)' });
+                                    }
+                                    connection.release();
+                                    // Award loyalty points after successful order
+                                    const pointsEarned = Math.floor(totalAmount / 10);
+                                    if (pointsEarned > 0) {
+                                        db.query('SELECT * FROM LoyaltyPoints WHERE CustomerID = ?', [customerId], (err, result) => {
+                                            if (err) {
+                                                console.error('Error checking LoyaltyPoints:', err);
+                                                return res.json({ message: 'Order placed, but error updating loyalty points.', trackingNumber: trackingId, totalTax });
+                                            }
+                                            if (result.length > 0) {
+                                                db.query('UPDATE LoyaltyPoints SET Points = Points + ? WHERE CustomerID = ?', [pointsEarned, customerId], (err2) => {
+                                                    if (err2) {
+                                                        console.error('Error updating LoyaltyPoints:', err2);
+                                                    } else {
+                                                        db.query('INSERT INTO PointsHistory (CustomerID, Points, Description, Date) VALUES (?, ?, ?, NOW())', [customerId, pointsEarned, 'Points earned from order'], (err3) => {
+                                                            if (err3) console.error('Error inserting PointsHistory:', err3);
+                                                        });
+                                                    }
+                                                });
+                                            } else {
+                                                db.query('INSERT INTO LoyaltyPoints (CustomerID, Points, EarnedDate) VALUES (?, ?, NOW())', [customerId, pointsEarned], (err2) => {
+                                                    if (err2) {
+                                                        console.error('Error inserting LoyaltyPoints:', err2);
+                                                    } else {
+                                                        db.query('INSERT INTO PointsHistory (CustomerID, Points, Description, Date) VALUES (?, ?, ?, NOW())', [customerId, pointsEarned, 'Points earned from order'], (err3) => {
+                                                            if (err3) console.error('Error inserting PointsHistory:', err3);
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    }
+                                    res.json({ message: 'Order, shipping, payment, and tax placed successfully!', trackingNumber: trackingId, totalTax, loyaltyPoints: pointsEarned });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
 
 // Return request endpoint
 app.post('/return/request', (req, res) => {
